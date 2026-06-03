@@ -8,6 +8,148 @@ ORANGE='\033[0;33m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
+WG_CONFIG_DIR="/etc/wireguard"
+WG_PARAMS_FILE="${WG_CONFIG_DIR}/params"
+WG_PF_CONF=""
+WG_PF_ANCHOR_NAME=""
+
+function getWgConfPath() {
+	echo "${WG_CONFIG_DIR}/${1}.conf"
+}
+
+function getWgPfAnchorPath() {
+	echo "${WG_CONFIG_DIR}/${1}.pf.conf"
+}
+
+function setWgPaths() {
+	if [[ ${OS} == 'freebsd' ]]; then
+		WG_CONFIG_DIR="/usr/local/etc/wireguard"
+	else
+		WG_CONFIG_DIR="/etc/wireguard"
+	fi
+
+	WG_PARAMS_FILE="${WG_CONFIG_DIR}/params"
+}
+
+function randomPort() {
+	if command -v shuf &>/dev/null; then
+		shuf -i49152-65535 -n1
+	elif command -v jot &>/dev/null; then
+		jot -r 1 49152 65535
+	else
+		awk 'BEGIN{srand(); print int(49152 + rand() * 16384)}'
+	fi
+}
+
+function detectDefaultInterface() {
+	if [[ ${OS} == 'freebsd' ]]; then
+		route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
+	else
+		ip -4 route ls | grep default | awk '/dev/ {for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}' | head -1
+	fi
+}
+
+function detectPublicIPv4() {
+	if [[ ${OS} == 'freebsd' ]]; then
+		local nic
+		nic=$(detectDefaultInterface)
+		if [[ -n ${nic} ]]; then
+			ifconfig "${nic}" 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}'
+		fi
+	else
+		ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1
+	fi
+}
+
+function detectPublicIPv6() {
+	if [[ ${OS} == 'freebsd' ]]; then
+		local nic
+		nic=$(route -n get -inet6 default 2>/dev/null | awk '/interface:/{print $2; exit}')
+		if [[ -n ${nic} ]]; then
+			ifconfig "${nic}" 2>/dev/null | awk '/inet6 / && $2 !~ /^fe80:/ {sub(/%.*/, "", $2); print $2; exit}'
+		fi
+	else
+		ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1
+	fi
+}
+
+function ipv4Cidr24() {
+	echo "${1%.*}.0/24"
+}
+
+function ipv6Cidr64() {
+	echo "${1%%::*}::/64"
+}
+
+function sedInPlace() {
+	if [[ ${OS} == 'freebsd' ]]; then
+		sed -i '' "$@"
+	else
+		sed -i "$@"
+	fi
+}
+
+function ensureFreeBsdPfAnchor() {
+	local server_conf
+
+	WG_PF_CONF="/etc/pf.conf"
+	WG_PF_ANCHOR_NAME="wireguard/${SERVER_WG_NIC}"
+
+	if [[ ! -e ${WG_PF_CONF} ]]; then
+		cat <<EOF >"${WG_PF_CONF}"
+# Managed by wireguard-install
+EOF
+	fi
+
+	if ! grep -q "load anchor \"${WG_PF_ANCHOR_NAME}\"" "${WG_PF_CONF}"; then
+		cat <<EOF >>"${WG_PF_CONF}"
+
+# BEGIN WIREGUARD ${SERVER_WG_NIC}
+anchor "${WG_PF_ANCHOR_NAME}"
+load anchor "${WG_PF_ANCHOR_NAME}" from "$(getWgPfAnchorPath "${SERVER_WG_NIC}")"
+# END WIREGUARD ${SERVER_WG_NIC}
+EOF
+	fi
+
+	cat <<EOF >"$(getWgPfAnchorPath "${SERVER_WG_NIC}")"
+ext_if = "${SERVER_PUB_NIC}"
+wg_if = "${SERVER_WG_NIC}"
+wg_port = "${SERVER_PORT}"
+wg_ipv4_net = "${SERVER_WG_IPV4%.*}.0/24"
+wg_ipv6_net = "$(ipv6Cidr64 "${SERVER_WG_IPV6}")"
+
+pass in quick on \$ext_if proto udp from any to (\$ext_if) port \$wg_port keep state
+pass quick on \$wg_if inet from \$wg_ipv4_net to any keep state
+pass quick on \$wg_if inet6 from \$wg_ipv6_net to any keep state
+pass out quick on \$ext_if inet from \$wg_ipv4_net to any nat-to (\$ext_if)
+pass out quick on \$ext_if inet6 from \$wg_ipv6_net to any nat-to (\$ext_if)
+EOF
+
+	sysrc gateway_enable=YES >/dev/null
+	sysrc ipv6_gateway_enable=YES >/dev/null
+	sysrc pf_enable=YES >/dev/null
+	service pf restart >/dev/null 2>&1 || service pf start >/dev/null 2>&1
+
+	server_conf=$(getWgConfPath "${SERVER_WG_NIC}")
+	cat <<EOF >>"${server_conf}"
+PostUp = service pf restart
+PostDown = service pf restart
+EOF
+}
+
+function disableFreeBsdPfAnchor() {
+	local anchor_path
+
+	anchor_path=$(getWgPfAnchorPath "${SERVER_WG_NIC}")
+
+	if [[ -e ${WG_PF_CONF} ]]; then
+		sedInPlace "/^# BEGIN WIREGUARD ${SERVER_WG_NIC}\$/,/^# END WIREGUARD ${SERVER_WG_NIC}\$/d" "${WG_PF_CONF}"
+	fi
+
+	rm -f "${anchor_path}"
+	service pf restart >/dev/null 2>&1 || true
+}
+
 function installPackages() {
 	if ! "$@"; then
 		echo -e "${RED}Failed to install packages.${NC}"
@@ -24,6 +166,9 @@ function isRoot() {
 }
 
 function checkVirt() {
+	if [[ ${OS} == "freebsd" ]]; then
+		return
+	fi
 	if command -v virt-what &>/dev/null; then
 		VIRT=$(virt-what)
 	else
@@ -44,6 +189,13 @@ function checkVirt() {
 }
 
 function checkOS() {
+	if [[ $(uname -s) == "FreeBSD" ]]; then
+		OS=freebsd
+		VERSION_ID=$(freebsd-version | cut -d'-' -f1)
+		setWgPaths
+		return
+	fi
+
 	source /etc/os-release
 	OS="${ID}"
 	if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
@@ -84,27 +236,36 @@ function checkOS() {
 		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS, AlmaLinux, Oracle or Arch Linux system"
 		exit 1
 	fi
+
+	setWgPaths
 }
 
 function getHomeDirForClient() {
 	local CLIENT_NAME=$1
+	local HOME_FROM_PASSWD
 
 	if [ -z "${CLIENT_NAME}" ]; then
 		echo "Error: getHomeDirForClient() requires a client name as argument"
 		exit 1
 	fi
 
+	if command -v getent &>/dev/null; then
+		HOME_FROM_PASSWD=$(getent passwd "${CLIENT_NAME}" | cut -d: -f6)
+	fi
+
 	# Home directory of the user, where the client configuration will be written
-	if [ -e "/home/${CLIENT_NAME}" ]; then
-		# if $1 is a user name
-		HOME_DIR="/home/${CLIENT_NAME}"
+	if [ -n "${HOME_FROM_PASSWD}" ] && [ -d "${HOME_FROM_PASSWD}" ]; then
+		HOME_DIR="${HOME_FROM_PASSWD}"
 	elif [ "${SUDO_USER}" ]; then
 		# if not, use SUDO_USER
 		if [ "${SUDO_USER}" == "root" ]; then
 			# If running sudo as root
 			HOME_DIR="/root"
 		else
-			HOME_DIR="/home/${SUDO_USER}"
+			if command -v getent &>/dev/null; then
+				HOME_DIR=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+			fi
+			HOME_DIR=${HOME_DIR:-"/home/${SUDO_USER}"}
 		fi
 	else
 		# if not SUDO_USER, use /root
@@ -129,15 +290,15 @@ function installQuestions() {
 	echo ""
 
 	# Detect public IPv4 or IPv6 address and pre-fill for the user
-	SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
+	SERVER_PUB_IP=$(detectPublicIPv4)
 	if [[ -z ${SERVER_PUB_IP} ]]; then
 		# Detect public IPv6 address
-		SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+		SERVER_PUB_IP=$(detectPublicIPv6)
 	fi
 	read -rp "IPv4 or IPv6 public address: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
 
 	# Detect public interface and pre-fill for the user
-	SERVER_NIC="$(ip -4 route ls | grep default | awk '/dev/ {for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}' | head -1)"
+	SERVER_NIC="$(detectDefaultInterface)"
 	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
 	done
@@ -155,7 +316,7 @@ function installQuestions() {
 	done
 
 	# Generate random number within private ports range
-	RANDOM_PORT=$(shuf -i49152-65535 -n1)
+	RANDOM_PORT=$(randomPort)
 	until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
 		read -rp "Server WireGuard port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT
 	done
@@ -226,6 +387,8 @@ function installWireGuard() {
 	elif [[ ${OS} == 'alpine' ]]; then
 		apk update
 		installPackages apk add wireguard-tools iptables libqrencode-tools
+	elif [[ ${OS} == 'freebsd' ]]; then
+		installPackages env ASSUME_ALWAYS_YES=yes pkg install wireguard-tools wireguard-go qrencode
 	fi
 
 	# Verify WireGuard installation
@@ -236,9 +399,9 @@ function installWireGuard() {
 	fi
 
 	# Make sure the directory exists (this does not seem the be the case on fedora)
-	mkdir /etc/wireguard >/dev/null 2>&1
+	mkdir -p "${WG_CONFIG_DIR}" >/dev/null 2>&1
 
-	chmod 600 -R /etc/wireguard/
+	chmod 600 -R "${WG_CONFIG_DIR}/"
 
 	SERVER_PRIV_KEY=$(wg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
@@ -254,21 +417,24 @@ SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
 SERVER_PUB_KEY=${SERVER_PUB_KEY}
 CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
+ALLOWED_IPS=${ALLOWED_IPS}" >"${WG_PARAMS_FILE}"
 
 	# Add server interface
-	echo "[Interface]
+echo "[Interface]
 Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
 ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
+PrivateKey = ${SERVER_PRIV_KEY}" >"$(getWgConfPath "${SERVER_WG_NIC}")"
 
 	if pgrep firewalld; then
 		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0"
 		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
 		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
-PostDown = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+PostDown = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"$(getWgConfPath "${SERVER_WG_NIC}")"
 	else
-		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+		if [[ ${OS} == 'freebsd' ]]; then
+			ensureFreeBsdPfAnchor
+		else
+			echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
 PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
@@ -279,12 +445,18 @@ PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEP
 PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"$(getWgConfPath "${SERVER_WG_NIC}")"
+		fi
 	fi
 
 	# Enable routing on the server
-	echo "net.ipv4.ip_forward = 1
+	if [[ ${OS} == 'freebsd' ]]; then
+		sysctl net.inet.ip.forwarding=1 >/dev/null
+		sysctl net.inet6.ip6.forwarding=1 >/dev/null
+	else
+		echo "net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
+	fi
 
 	if [[ ${OS} == 'fedora' ]]; then
 		chmod -v 700 /etc/wireguard
@@ -297,6 +469,13 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		ln -s /etc/init.d/wg-quick "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
 		rc-service "wg-quick.${SERVER_WG_NIC}" start
 		rc-update add "wg-quick.${SERVER_WG_NIC}"
+	elif [[ ${OS} == 'freebsd' ]]; then
+		sysrc wireguard_enable=YES >/dev/null
+		if ! sysrc -n wireguard_interfaces 2>/dev/null | tr ' ' '\n' | grep -qx "${SERVER_WG_NIC}"; then
+			sysrc wireguard_interfaces+=" ${SERVER_WG_NIC}" >/dev/null
+		fi
+
+		service wireguard start "${SERVER_WG_NIC}"
 	else
 		sysctl --system
 
@@ -310,6 +489,8 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 	# Check if WireGuard is running
 	if [[ ${OS} == 'alpine' ]]; then
 		rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status
+	elif [[ ${OS} == 'freebsd' ]]; then
+		service wireguard status "${SERVER_WG_NIC}" >/dev/null 2>&1
 	else
 		systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
 	fi
@@ -320,6 +501,8 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		echo -e "\n${RED}WARNING: WireGuard does not seem to be running.${NC}"
 		if [[ ${OS} == 'alpine' ]]; then
 			echo -e "${ORANGE}You can check if WireGuard is running with: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
+		elif [[ ${OS} == 'freebsd' ]]; then
+			echo -e "${ORANGE}You can check if WireGuard is running with: service wireguard status ${SERVER_WG_NIC}${NC}"
 		else
 			echo -e "${ORANGE}You can check if WireGuard is running with: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
 		fi
@@ -328,6 +511,8 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		echo -e "\n${GREEN}WireGuard is running.${NC}"
 		if [[ ${OS} == 'alpine' ]]; then
 			echo -e "${GREEN}You can check the status of WireGuard with: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
+		elif [[ ${OS} == 'freebsd' ]]; then
+			echo -e "${GREEN}You can check the status of WireGuard with: service wireguard status ${SERVER_WG_NIC}\n\n${NC}"
 		else
 			echo -e "${GREEN}You can check the status of WireGuard with: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
 		fi
@@ -351,7 +536,7 @@ function newClient() {
 
 	until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
 		read -rp "Client name: " -e CLIENT_NAME
-		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "$(getWgConfPath "${SERVER_WG_NIC}")")
 
 		if [[ ${CLIENT_EXISTS} != 0 ]]; then
 			echo ""
@@ -361,7 +546,7 @@ function newClient() {
 	done
 
 	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "$(getWgConfPath "${SERVER_WG_NIC}")")
 		if [[ ${DOT_EXISTS} == '0' ]]; then
 			break
 		fi
@@ -377,7 +562,7 @@ function newClient() {
 	until [[ ${IPV4_EXISTS} == '0' ]]; do
 		read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
 		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
-		IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "$(getWgConfPath "${SERVER_WG_NIC}")")
 
 		if [[ ${IPV4_EXISTS} != 0 ]]; then
 			echo ""
@@ -390,7 +575,7 @@ function newClient() {
 	until [[ ${IPV6_EXISTS} == '0' ]]; do
 		read -rp "Client WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
 		CLIENT_WG_IPV6="${BASE_IP}::${DOT_IP}"
-		IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "$(getWgConfPath "${SERVER_WG_NIC}")")
 
 		if [[ ${IPV6_EXISTS} != 0 ]]; then
 			echo ""
@@ -424,11 +609,11 @@ Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# Add the client as a peer to the server
-	echo -e "\n### Client ${CLIENT_NAME}
+echo -e "\n### Client ${CLIENT_NAME}
 [Peer]
 PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
-AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"$(getWgConfPath "${SERVER_WG_NIC}")"
 
 	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
 
@@ -443,18 +628,18 @@ AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SER
 }
 
 function listClients() {
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "$(getWgConfPath "${SERVER_WG_NIC}")")
 	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
 		echo ""
 		echo "You have no existing clients!"
 		exit 1
 	fi
 
-	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+	grep -E "^### Client" "$(getWgConfPath "${SERVER_WG_NIC}")" | cut -d ' ' -f 3 | nl -s ') '
 }
 
 function revokeClient() {
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "$(getWgConfPath "${SERVER_WG_NIC}")")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
 		echo "You have no existing clients!"
@@ -463,7 +648,7 @@ function revokeClient() {
 
 	echo ""
 	echo "Select the existing client you want to revoke"
-	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+	grep -E "^### Client" "$(getWgConfPath "${SERVER_WG_NIC}")" | cut -d ' ' -f 3 | nl -s ') '
 	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
 		if [[ ${CLIENT_NUMBER} == '1' ]]; then
 			read -rp "Select one client [1]: " CLIENT_NUMBER
@@ -473,10 +658,10 @@ function revokeClient() {
 	done
 
 	# match the selected number to a client name
-	CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
+	CLIENT_NAME=$(grep -E "^### Client" "$(getWgConfPath "${SERVER_WG_NIC}")" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
 
 	# remove [Peer] block matching $CLIENT_NAME
-	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+	sedInPlace "/^### Client ${CLIENT_NAME}\$/,/^$/d" "$(getWgConfPath "${SERVER_WG_NIC}")"
 
 	# remove generated client file
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
@@ -489,7 +674,7 @@ function revokeClient() {
 function uninstallWg() {
 	echo ""
 	echo -e "\n${RED}WARNING: This will uninstall WireGuard and remove all the configuration files!${NC}"
-	echo -e "${ORANGE}Please backup the /etc/wireguard directory if you want to keep your configuration files.\n${NC}"
+	echo -e "${ORANGE}Please backup the ${WG_CONFIG_DIR} directory if you want to keep your configuration files.\n${NC}"
 	read -rp "Do you really want to remove WireGuard? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == 'y' ]]; then
@@ -500,6 +685,9 @@ function uninstallWg() {
 			rc-update del "wg-quick.${SERVER_WG_NIC}"
 			unlink "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
 			rc-update del sysctl
+		elif [[ ${OS} == 'freebsd' ]]; then
+			WG_PF_CONF="/etc/pf.conf"
+			service wireguard stop "${SERVER_WG_NIC}" >/dev/null 2>&1 || true
 		else
 			systemctl stop "wg-quick@${SERVER_WG_NIC}"
 			systemctl disable "wg-quick@${SERVER_WG_NIC}"
@@ -526,13 +714,29 @@ function uninstallWg() {
 			(cd qrencode-4.1.1 || exit && make uninstall)
 			rm -rf qrencode-* || exit
 			apk del wireguard-tools libqrencode libqrencode-tools
+		elif [[ ${OS} == 'freebsd' ]]; then
+			disableFreeBsdPfAnchor
+			sysrc wireguard_enable=NO >/dev/null || true
+			if sysrc -n wireguard_interfaces 2>/dev/null | tr ' ' '\n' | grep -qx "${SERVER_WG_NIC}"; then
+				UPDATED_INTERFACES=$(sysrc -n wireguard_interfaces | tr ' ' '\n' | grep -vx "${SERVER_WG_NIC}" | xargs)
+				if [[ -n ${UPDATED_INTERFACES} ]]; then
+					sysrc wireguard_interfaces="${UPDATED_INTERFACES}" >/dev/null
+				else
+					sysrc -x wireguard_interfaces >/dev/null 2>&1 || true
+				fi
+			fi
+			pkg delete -y wireguard-tools wireguard-go qrencode || true
 		fi
 
-		rm -rf /etc/wireguard
-		rm -f /etc/sysctl.d/wg.conf
+		rm -rf "${WG_CONFIG_DIR}"
+		if [[ ${OS} != 'freebsd' ]]; then
+			rm -f /etc/sysctl.d/wg.conf
+		fi
 
 		if [[ ${OS} == 'alpine' ]]; then
 			rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status &>/dev/null
+		elif [[ ${OS} == 'freebsd' ]]; then
+			service wireguard status "${SERVER_WG_NIC}" >/dev/null 2>&1
 		else
 			# Reload sysctl
 			sysctl --system
@@ -593,8 +797,8 @@ function manageMenu() {
 initialCheck
 
 # Check if WireGuard is already installed and load params
-if [[ -e /etc/wireguard/params ]]; then
-	source /etc/wireguard/params
+if [[ -e ${WG_PARAMS_FILE} ]]; then
+	source "${WG_PARAMS_FILE}"
 	manageMenu
 else
 	installWireGuard
