@@ -388,7 +388,13 @@ function installWireGuard() {
 		apk update
 		installPackages apk add wireguard-tools iptables libqrencode-tools
 	elif [[ ${OS} == 'freebsd' ]]; then
-		installPackages env ASSUME_ALWAYS_YES=yes pkg install wireguard-tools wireguard-go qrencode
+		installPackages env ASSUME_ALWAYS_YES=yes pkg install wireguard-tools wireguard-go
+		if ! env ASSUME_ALWAYS_YES=yes pkg install qrencode; then
+			if ! env ASSUME_ALWAYS_YES=yes pkg install graphics/libqrencode; then
+				echo -e "${ORANGE}Optional QR code package is not available in the configured FreeBSD repositories.${NC}"
+				echo -e "${ORANGE}Client configuration files will still be generated, but QR code output will be skipped.${NC}"
+			fi
+		fi
 	fi
 
 	# Verify WireGuard installation
@@ -725,7 +731,7 @@ function uninstallWg() {
 					sysrc -x wireguard_interfaces >/dev/null 2>&1 || true
 				fi
 			fi
-			pkg delete -y wireguard-tools wireguard-go qrencode || true
+			pkg delete -y wireguard-tools wireguard-go qrencode graphics/libqrencode || true
 		fi
 
 		rm -rf "${WG_CONFIG_DIR}"
