@@ -192,15 +192,11 @@ function installWireGuard() {
 	# Install WireGuard tools and module
 	if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' && ${VERSION_ID} -gt 10 ]]; then
 		apt-get update
-		installPackages apt-get install -y wireguard iptables resolvconf qrencode
-	elif [[ ${OS} == 'debian' ]]; then
-		if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
-			echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
-			apt-get update
-		fi
-		apt-get update
-		installPackages apt-get install -y iptables resolvconf qrencode
-		installPackages apt-get install -y -t buster-backports wireguard
+        if ! command -v wg >/dev/null 2>&1; then
+            installPackages apt-get install -y wireguard
+        fi
+
+        installPackages apt-get install -y nftables resolvconf qrencode
 	elif [[ ${OS} == 'fedora' ]]; then
 		if [[ ${VERSION_ID} -lt 32 ]]; then
 			installPackages dnf install -y dnf-plugins-core
@@ -267,20 +263,25 @@ PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
 		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
 		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
 PostDown = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
-	else
-		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
-	fi
+    else
+        echo "PostUp = nft add chain inet filter wg_forward
+    PostUp = nft add rule inet filter wg_forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_WG_NIC} accept
+    PostUp = nft add rule inet filter wg_forward iifname ${SERVER_WG_NIC} accept
+    PostUp = nft insert rule inet filter forward jump wg_forward
+
+    PostUp = nft add table ip wg_nat
+    PostUp = nft 'add chain ip wg_nat postrouting { type nat hook postrouting priority srcnat; }'
+    PostUp = nft add rule ip wg_nat postrouting oifname ${SERVER_PUB_NIC} masquerade
+
+    PostUp = nft add table ip6 wg_nat6
+    PostUp = nft 'add chain ip6 wg_nat6 postrouting { type nat hook postrouting priority srcnat; }'
+    PostUp = nft add rule ip6 wg_nat6 postrouting oifname ${SERVER_PUB_NIC} masquerade
+
+    PostDown = nft delete rule inet filter forward handle \$(nft -a list chain inet filter forward | awk '/jump wg_forward/ {print \$NF}')
+    PostDown = nft delete chain inet filter wg_forward
+    PostDown = nft delete table ip wg_nat
+    PostDown = nft delete table ip6 wg_nat6" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+    fi
 
 	# Enable routing on the server
 	echo "net.ipv4.ip_forward = 1
@@ -506,7 +507,7 @@ function uninstallWg() {
 		fi
 
 		if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
-			apt-get remove -y wireguard wireguard-tools qrencode
+			apt-get remove -y  qrencode
 		elif [[ ${OS} == 'fedora' ]]; then
 			dnf remove -y --noautoremove wireguard-tools qrencode
 			if [[ ${VERSION_ID} -lt 32 ]]; then
